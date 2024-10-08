@@ -1,0 +1,6 @@
+# Dependências
+node_modules/
+
+
+# Outros arquivos a serem ignorados
+.env
