@@ -21,16 +21,17 @@ const pool = new Pool({
 app.use(cors());
 app.use(express.json());
 
+//Middleware para verficar se a requisição vem com token
 const authenticateJWT = (req, res, next) => {
   const token = req.header("Authorization")?.split(" ")[1];
 
   if (!token) {
-    return res.sendStatus(403); // Proibido
+    return res.sendStatus(403);
   }
   console.log(process.env.JWT_SECRET);
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) {
-      return res.sendStatus(403); // Proibido
+      return res.sendStatus(403);
     }
 
     req.user = user;
@@ -38,7 +39,33 @@ const authenticateJWT = (req, res, next) => {
   });
 };
 
-// >> Rota para obter usuario
+// >>> Rota para obter o usuário logado e verificar se é superusuário
+app.get("/api/users/loggedUser", authenticateJWT, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const result = await pool.query(
+      "SELECT id, username, role FROM usuarios WHERE id = $1",
+      [userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).send("Usuário não encontrado.");
+    }
+
+    const user = result.rows[0];
+    res.json({
+      id: user.id,
+      username: user.username,
+      role: user.role,
+    });
+  } catch (err) {
+    console.error(`Erro ao buscar usuário logado: ${err}`);
+    res.status(500).send("Erro ao buscar usuário logado.");
+  }
+});
+
+// >> Rota para obter os usuarios
 app.get("/api/users", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM usuarios");
@@ -49,13 +76,15 @@ app.get("/api/users", async (req, res) => {
   }
 });
 
-// >>> Rota para registrar um novo usuário
+// >> Rota para registrar um novo usuário
 app.post("/api/register", async (req, res) => {
-  const { username, password } = req.body;
+  let { username, password } = req.body;
 
   if (!username || !password) {
     return res.status(400).send("Nome de usuário e senha são obrigatórios.");
   }
+
+  username = username.toLowerCase();
 
   const hashedPassword = await bcrypt.hash(password, 10);
 
@@ -81,8 +110,6 @@ app.post("/api/login", async (req, res) => {
     return res.status(400).send("Nome de usuário e senha são obrigatórios.");
   }
 
-  console.log(password);
-
   try {
     const result = await pool.query(
       "SELECT * FROM Usuarios WHERE username = $1",
@@ -94,7 +121,6 @@ app.post("/api/login", async (req, res) => {
     }
 
     const user = result.rows[0];
-    console.log(user);
 
     // Comparar senhas
     const match = await bcrypt.compare(password, user.senha);
@@ -129,56 +155,21 @@ app.get("/api/produtos", async (req, res) => {
   }
 });
 
-// >>> Rota para obter todas as vendas com detalhes dos produtos
+// >>> Rota para obter todos as vendas
 app.get("/api/vendas", async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT
-        v.id AS venda_id,
-        v.cliente,
-        v.data_venda,
-        v.total,
-        vp.sku,
-        p.produto,
-        vp.quantidade,
-        (vp.quantidade * p.preco_cheio) AS subtotal
-      FROM Vendas v
-      JOIN Venda_Produtos vp ON v.id = vp.venda_id
-      JOIN Produtos p ON vp.sku = p.sku
-      ORDER BY v.id, vp.id;
-    `);
-    // Agrupar produtos por venda
-    const vendas = {};
-    result.rows.forEach((row) => {
-      if (!vendas[row.venda_id]) {
-        vendas[row.venda_id] = {
-          id: row.venda_id,
-          cliente: row.cliente,
-          data_venda: row.data_venda,
-          total_venda: parseFloat(row.total),
-          produtos: [],
-        };
-      }
-      vendas[row.venda_id].produtos.push({
-        sku: row.sku,
-        produto: row.produto,
-        quantidade: row.quantidade,
-        preco: parseFloat(row.preco_cheio),
-        subtotal: parseFloat(row.subtotal),
-      });
-    });
-    res.json(Object.values(vendas));
-  } catch (err) {
-    console.error(`Ocorreu um erro2: ${err}`);
-    res.status(500).send("Erro ao buscar as vendas");
+    const result = await pool.query("SELECT * FROM vendas");
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Erro ao buscar solicitações:", error);
+    res.status(500).json({ error: "Erro ao buscar solicitações" });
   }
 });
 
-// >>> Rota para adicionar uma nova venda
+// >>> Rota para cadastrar ou solicitar uma venda
 app.post("/api/vendas", async (req, res) => {
   const { cliente, tpPagamento, produtos, regiao, prazo, desconto } = req.body; // produtos é um array de { sku, quantidade }
 
-  // Validação dos dados da requisição
   if (
     !cliente ||
     !tpPagamento ||
@@ -198,17 +189,9 @@ app.post("/api/vendas", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Inserir a venda na tabela Vendas
-    const vendaResult = await client.query(
-      "INSERT INTO Vendas (cliente, total) VALUES ($1, $2) RETURNING id, data_venda",
-      [cliente, 0.0] // Inicialmente total é 0.00, será atualizado depois
-    );
-
-    const vendaId = vendaResult.rows[0].id;
-
     let somaDosProdutos = 0;
 
-    // Inserir cada produto da venda na tabela Venda_Produtos
+    // Calcular o subtotal dos produtos
     for (const produto of produtos) {
       const { sku, quantidade } = produto;
 
@@ -228,92 +211,159 @@ app.post("/api/vendas", async (req, res) => {
           : produtoResult.rows[0].preco_descontado
       );
 
-      if (isNaN(preco)) {
-        throw new Error("O preço calculado é inválido.");
-      }
-
       const subtotal = preco * quantidade;
       somaDosProdutos += subtotal;
-
-      // Inserir na tabela Venda_Produtos
-      await client.query(
-        "INSERT INTO Venda_Produtos (venda_id, sku, quantidade) VALUES ($1, $2, $3)",
-        [vendaId, sku, quantidade]
-      );
     }
 
     let frete = 0.0;
-    if (regiao == "0") {
-      //nordeste
-      frete = 10;
-    } else if (regiao == "1") {
-      //norte
-      frete = 15;
-    } else if (regiao == "2") {
-      //sudeste
-      frete = 15;
-    } else if (regiao == "3") {
-      //centro-oeste
-      frete = 15;
-    } else if (regiao == "4") {
-      //sum
-      frete = 20;
-    }
+    if (regiao == "0") frete = 10;
+    else if (regiao == "1") frete = 15;
+    else if (regiao == "2") frete = 15;
+    else if (regiao == "3") frete = 15;
+    else if (regiao == "4") frete = 20;
 
     let adicional = 0;
     let descontoMaximo = 0;
     if (prazo === "0") {
-      // normal
       adicional = 0;
       descontoMaximo = Math.max(somaDosProdutos * 0.05, frete);
     } else if (prazo === "1") {
-      // Turbo
-      adicional = somaDosProdutos * 0.1;
+      adicional = somaDosProdutos * 0.1; //10% da soma dos produtos
       descontoMaximo = Math.max(somaDosProdutos * 0.1, frete);
     } else if (prazo === "2") {
-      // Super Turbo
-      adicional = somaDosProdutos * 0.2;
+      adicional = somaDosProdutos * 0.2; //20% da soma dos produtos
       descontoMaximo = Math.max(somaDosProdutos * 0.2, frete);
     }
 
-    console.log(somaDosProdutos);
-    console.log(frete);
-    console.log(adicional);
-    console.log(desconto);
     const valorTotalPedido = somaDosProdutos + frete + adicional - desconto;
-    console.log(valorTotalPedido);
-    console.log(descontoMaximo);
 
+    // Verifica se o desconto é maior que o máximo permitido
     if (desconto > descontoMaximo) {
-      return res
-        .status(400)
-        .send(
-          `O desconto excede o máximo permitido de ${descontoMaximo.toFixed(
-            2
-          )}.`
-        );
+      // Inserir na tabela Solicitações
+      const solicitacaoResult = await client.query(
+        "INSERT INTO solicitacoes (cliente, total, status) VALUES ($1, $2, $3) RETURNING id",
+        [cliente, valorTotalPedido, "pendente"] // Assumindo um status padrão de 'pendente'
+      );
+
+      const idSolicitacao = solicitacaoResult.rows[0].id;
+
+      console.log(
+        `Venda registrada na tabela de solicitações. ID: ${idSolicitacao}`
+      );
+
+      await client.query("COMMIT");
+
+      return res.status(201).json({
+        mensagem:
+          "A venda excedeu o valor de desconto máximo permito, será enviado uma solicitação, aguarde!",
+        id: idSolicitacao,
+        total_venda: valorTotalPedido,
+      });
     }
 
-    // Atualizar o campo 'total' na tabela Vendas
+    // Se o desconto estiver dentro do limite, registrar na tabela Vendas
+    const vendaResult = await client.query(
+      "INSERT INTO Vendas (cliente, total) VALUES ($1, $2) RETURNING id, data_venda",
+      [cliente, valorTotalPedido]
+    );
+
+    // Atualiza o total na tabela Vendas
     await client.query("UPDATE Vendas SET total = $1 WHERE id = $2", [
       valorTotalPedido,
-      vendaId,
+      vendaResult.rows[0].id,
     ]);
 
     await client.query("COMMIT");
 
     res.status(201).json({
       mensagem: "Venda registrada com sucesso!",
-      venda_id: vendaId,
+      venda_id: vendaResult.rows[0].id,
       data_venda: vendaResult.rows[0].data_venda,
       total_venda: valorTotalPedido,
+      //const valorTotalPedido = somaDosProdutos + frete + adicional - desconto;
     });
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error(`Ocorreu um erro3: ${err.message}`);
+    console.error(`Ocorreu um erro: ${err.message}`);
     res.status(500).send(`Erro ao registrar a venda: ${err.message}`);
   } finally {
     client.release();
+  }
+});
+
+// >>> Rota para aceitar uma solicitação
+app.put("/api/solicitacoes/:id", async (req, res) => {
+  const { id } = req.params; // ID da solicitação
+  const { status } = req.body; // Novo status (aceito ou negado)
+
+  if (!status || (status !== "aceito" && status !== "negado")) {
+    return res
+      .status(400)
+      .send("Status inválido. Deve ser 'aceito' ou 'negado'.");
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // Atualiza o status da solicitação
+    await client.query("UPDATE solicitacoes SET status = $1 WHERE id = $2", [
+      status,
+      id,
+    ]);
+
+    if (status === "aceito") {
+      const solicitacaoResult = await client.query(
+        "SELECT cliente, total FROM solicitacoes WHERE id = $1",
+        [id]
+      );
+
+      if (solicitacaoResult.rows.length === 0) {
+        throw new Error("Solicitação não encontrada.");
+      }
+
+      const { cliente, total } = solicitacaoResult.rows[0];
+
+      // Inserir a venda na tabela Vendas
+      const vendaResult = await client.query(
+        "INSERT INTO Vendas (cliente, total) VALUES ($1, $2) RETURNING id, data_venda",
+        [cliente, total]
+      );
+
+      await client.query("COMMIT");
+
+      return res.status(200).json({
+        mensagem: "Solicitação aceita e venda registrada com sucesso!",
+        venda_id: vendaResult.rows[0].id,
+        data_venda: vendaResult.rows[0].data_venda,
+      });
+    }
+
+    await client.query("COMMIT");
+
+    res.status(200).json({
+      mensagem: "Status da solicitação atualizado para 'negado'.",
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(`Ocorreu um erro: ${err.message}`);
+    res
+      .status(500)
+      .send(`Erro ao atualizar o status da solicitação: ${err.message}`);
+  } finally {
+    client.release();
+  }
+});
+
+// >>> Rota para listar solicitações
+app.get("/api/solicitacoes", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM solicitacoes");
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Erro ao buscar solicitações:", error);
+    res.status(500).json({ error: "Erro ao buscar solicitações" });
   }
 });
 
